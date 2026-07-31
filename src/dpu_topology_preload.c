@@ -30,10 +30,12 @@ dpu_alloc(uint32_t nr_dpus, const char *profile, struct dpu_set_t *set)
 
     status = real_dpu_alloc(nr_dpus, profile, set);
     if (status == DPU_OK) {
+        fputc('\n', stdout);
         int topology_status = allocation_fprint_overview(stdout, set);
         if (topology_status < 0)
             fprintf(stderr, "DPU topology unavailable (error %d)\n",
                     topology_status);
+        fputc('\n', stdout);
         fflush(stdout);
     }
     return status;
