@@ -65,6 +65,17 @@ void dpu_topology_fprint_grouped(FILE *stream,
 int dpu_topology_fprint_system(FILE *stream);
 int dpu_topology_fprint_system_grouped(FILE *stream);
 
+/* Direct allocation queries. Negative return values are errno codes. */
+int allocation_socket_count(const struct dpu_set_t *set);
+int allocation_numa_node_count(const struct dpu_set_t *set);
+int allocation_dimm_count(const struct dpu_set_t *set);
+int allocation_channel_count(const struct dpu_set_t *set);
+int allocation_spans_sockets(const struct dpu_set_t *set);
+int allocation_has_channel_contention(const struct dpu_set_t *set);
+
+/* Prints a compact allocation summary after one topology inspection. */
+int allocation_fprint_overview(FILE *stream, const struct dpu_set_t *set);
+
 #ifdef __cplusplus
 }
 #endif

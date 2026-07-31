@@ -12,6 +12,15 @@ lib/dpu_topology/build/dpu-topology 256                        # Allocation
 lib/dpu_topology/build/dpu-topology 256 --group-by-dimm        # By DIMM
 ```
 
+Print the overview automatically after any successful `dpu_alloc()`:
+
+```sh
+LD_PRELOAD="$PWD/lib/dpu_topology/build/libdpu_topology_preload.so" ./app
+```
+
+For `sweep.py`, keep the same `LD_PRELOAD` prefix and add `-v` to show captured
+benchmark output.
+
 ```c
 #include <dpu_topology.h>
 
@@ -20,7 +29,13 @@ if (dpu_topology_inspect(dpu_set, &topology) == 0) {
     dpu_topology_fprint(stdout, &topology);
     dpu_topology_free(&topology);
 }
+
+int sockets = allocation_socket_count(&dpu_set);
+allocation_fprint_overview(stdout, &dpu_set);
 ```
+
+Queries: `allocation_{socket,numa_node,dimm,channel}_count()`,
+`allocation_spans_sockets()`, and `allocation_has_channel_contention()`.
 
 Link `build/libdpu_topology.a` with the UPMEM host libraries. Physical DIMMs
 are identified by VPD serial number because the driver exposes no motherboard
