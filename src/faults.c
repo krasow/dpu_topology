@@ -521,5 +521,11 @@ dpu_fault_report_fprint(FILE *stream, const dpu_fault_report_t *report)
         fprintf(stream, " %s", id);
     }
     fputc('\n', stream);
+    if (report->nr_dpus_unverified != 0)
+        fprintf(stream,
+                "  %u DPU%s on ranks with a hung DPU were only checked for "
+                "MRAM faults\n",
+                report->nr_dpus_unverified,
+                plural(report->nr_dpus_unverified));
     free(faults);
 }

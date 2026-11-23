@@ -38,11 +38,24 @@ typedef struct {
     uint64_t expected_checksums[HEALTH_NR_TASKLETS];
     uint64_t checksums[HEALTH_NR_TASKLETS];
     int crashed;
+    int verified; /* its rank finished, so its output can be read back */
 } dpu_state_t;
 
 typedef struct {
+    struct dpu_set_t set;
+    uint32_t first; /* set index of the rank's first DPU */
+    uint32_t nr_dpus;
+    int done;
+} rank_state_t;
+
+typedef struct {
+    struct dpu_set_t set;
     dpu_state_t *dpus;
     uint32_t nr_dpus;
+    rank_state_t *ranks;
+    uint32_t nr_ranks;
+    /* Set after a timeout: only finished ranks may be accessed. */
+    int partial;
     size_t nr_words;    /* per DPU */
     size_t chunk_words; /* per DPU per transfer */
     uint64_t *input;    /* nr_dpus * chunk_words */
@@ -149,6 +162,8 @@ verify_output(health_state_t *state, uint32_t dpu)
     dpu_state_t *info = &state->dpus[dpu];
     size_t word;
 
+    if (!info->verified)
+        return;
     for (word = 0; word < state->length; ++word) {
         size_t position = state->offset + word;
         unsigned tasklet =
@@ -165,31 +180,67 @@ verify_output(health_state_t *state, uint32_t dpu)
     }
 }
 
+/* Transfers one buffer per DPU; DPU i uses base + i * stride. */
 static int
-transfer_chunk(health_state_t *state, dpu_xfer_t direction,
-               struct dpu_set_t set, uint64_t *buffer)
+transfer_set(struct dpu_set_t set, uint32_t first, dpu_xfer_t direction,
+             const char *symbol, uint32_t symbol_offset, size_t length,
+             void *base, size_t stride)
 {
     struct dpu_set_t dpu;
     uint32_t index;
 
     DPU_FOREACH(set, dpu, index)
     {
-        if (dpu_prepare_xfer(dpu, chunk_of(state, buffer, index)) != DPU_OK)
+        if (dpu_prepare_xfer(dpu, (char *)base + (first + index) * stride)
+            != DPU_OK)
             return -EIO;
     }
-    return dpu_push_xfer(set, direction, DPU_MRAM_HEAP_POINTER_NAME,
-                         state->offset * sizeof(uint64_t),
-                         state->length * sizeof(uint64_t), DPU_XFER_DEFAULT)
+    return dpu_push_xfer(set, direction, symbol, symbol_offset, length,
+                         DPU_XFER_DEFAULT)
                    == DPU_OK
                ? 0
                : -EIO;
 }
 
+/*
+ * Transfers to or from every DPU at once, or after a timeout rank by rank,
+ * skipping ranks that still have a running (hung) DPU.
+ */
+static int
+transfer(health_state_t *state, dpu_xfer_t direction, const char *symbol,
+         uint32_t symbol_offset, size_t length, void *base, size_t stride)
+{
+    uint32_t index;
+    int status;
+
+    if (!state->partial)
+        return transfer_set(state->set, 0, direction, symbol, symbol_offset,
+                            length, base, stride);
+    for (index = 0; index < state->nr_ranks; ++index) {
+        const rank_state_t *rank = &state->ranks[index];
+
+        if (!rank->done)
+            continue;
+        status = transfer_set(rank->set, rank->first, direction, symbol,
+                              symbol_offset, length, base, stride);
+        if (status != 0)
+            return status;
+    }
+    return 0;
+}
+
+static int
+transfer_chunk(health_state_t *state, dpu_xfer_t direction, uint64_t *buffer)
+{
+    return transfer(state, direction, DPU_MRAM_HEAP_POINTER_NAME,
+                    (uint32_t)(state->offset * sizeof(uint64_t)),
+                    state->length * sizeof(uint64_t), buffer,
+                    state->chunk_words * sizeof(uint64_t));
+}
+
 /* Calls step() once per chunk after moving the chunk window. */
 static int
-for_each_chunk(health_state_t *state,
-               int (*step)(health_state_t *, struct dpu_set_t),
-               struct dpu_set_t set)
+for_each_chunk(health_state_t *state, int (*step)(health_state_t *))
 {
     int status = 0;
 
@@ -198,21 +249,19 @@ for_each_chunk(health_state_t *state,
         state->length = state->nr_words - state->offset;
         if (state->length > state->chunk_words)
             state->length = state->chunk_words;
-        status = step(state, set);
+        status = step(state);
     }
     return status;
 }
 
 static int
-memory_step(health_state_t *state, struct dpu_set_t set)
+memory_step(health_state_t *state)
 {
     int status;
 
     for_each_dpu(state, generate_input);
-    if ((status = transfer_chunk(state, DPU_XFER_TO_DPU, set, state->input))
-            != 0
-        || (status = transfer_chunk(state, DPU_XFER_FROM_DPU, set,
-                                    state->output))
+    if ((status = transfer_chunk(state, DPU_XFER_TO_DPU, state->input)) != 0
+        || (status = transfer_chunk(state, DPU_XFER_FROM_DPU, state->output))
                != 0)
         return status;
     for_each_dpu(state, compare_readback);
@@ -220,9 +269,9 @@ memory_step(health_state_t *state, struct dpu_set_t set)
 }
 
 static int
-verify_step(health_state_t *state, struct dpu_set_t set)
+verify_step(health_state_t *state)
 {
-    int status = transfer_chunk(state, DPU_XFER_FROM_DPU, set, state->output);
+    int status = transfer_chunk(state, DPU_XFER_FROM_DPU, state->output);
 
     if (status == 0)
         for_each_dpu(state, verify_output);
@@ -253,9 +302,12 @@ add_fault(dpu_fault_report_t *report, const dpu_state_t *info,
     return dpu_fault_report_append(report, &fault);
 }
 
-/* Launches asynchronously so a hung DPU is reported instead of blocking. */
+/*
+ * Launches asynchronously so a hung DPU is reported instead of blocking.
+ * On timeout, ranks that finished are still marked verifiable.
+ */
 static int
-run_kernel(struct dpu_set_t set, health_state_t *state, uint32_t timeout_ms,
+run_kernel(health_state_t *state, uint32_t timeout_ms,
            dpu_fault_report_t *report)
 {
     const struct timespec pause = {0, 1000000};
@@ -264,22 +316,23 @@ run_kernel(struct dpu_set_t set, health_state_t *state, uint32_t timeout_ms,
     uint32_t index;
     int status = 0;
 
-    if (dpu_launch(set, DPU_ASYNCHRONOUS) != DPU_OK)
+    if (dpu_launch(state->set, DPU_ASYNCHRONOUS) != DPU_OK)
         return -EIO;
 
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (;;) {
-        struct dpu_set_t rank_set;
-
         all_done = 1;
-        DPU_RANK_FOREACH(set, rank_set)
-        {
+        for (index = 0; index < state->nr_ranks; ++index) {
+            rank_state_t *rank = &state->ranks[index];
             bool done = false;
             bool fault = false;
 
-            if (dpu_status_rank(dpu_rank_from_set(rank_set), &done, &fault)
+            if (rank->done)
+                continue;
+            if (dpu_status_rank(dpu_rank_from_set(rank->set), &done, &fault)
                 != DPU_OK)
                 return -EIO;
+            rank->done = done;
             all_done = all_done && done;
         }
         if (all_done || elapsed_ms(&start) > timeout_ms)
@@ -287,7 +340,17 @@ run_kernel(struct dpu_set_t set, health_state_t *state, uint32_t timeout_ms,
         nanosleep(&pause, NULL);
     }
     if (all_done)
-        (void)dpu_sync(set); /* Faults are collected per DPU below. */
+        (void)dpu_sync(state->set); /* Faults are collected per DPU below. */
+    else
+        state->partial = 1;
+
+    for (index = 0; index < state->nr_ranks; ++index) {
+        const rank_state_t *rank = &state->ranks[index];
+        uint32_t dpu;
+
+        for (dpu = rank->first; dpu < rank->first + rank->nr_dpus; ++dpu)
+            state->dpus[dpu].verified = rank->done;
+    }
 
     for (index = 0; index < state->nr_dpus && status == 0; ++index) {
         dpu_state_t *info = &state->dpus[index];
@@ -314,27 +377,16 @@ run_kernel(struct dpu_set_t set, health_state_t *state, uint32_t timeout_ms,
 }
 
 static int
-read_checksums(struct dpu_set_t set, health_state_t *state)
+read_checksums(health_state_t *state)
 {
-    struct dpu_set_t dpu;
-    uint32_t index;
-
-    DPU_FOREACH(set, dpu, index)
-    {
-        if (dpu_prepare_xfer(dpu, state->dpus[index].checksums) != DPU_OK)
-            return -EIO;
-    }
-    return dpu_push_xfer(set, DPU_XFER_FROM_DPU, "health_checksums", 0,
-                         sizeof(state->dpus[0].checksums), DPU_XFER_DEFAULT)
-                   == DPU_OK
-               ? 0
-               : -EIO;
+    return transfer(state, DPU_XFER_FROM_DPU, "health_checksums", 0,
+                    sizeof(state->dpus[0].checksums),
+                    state->dpus[0].checksums, sizeof(state->dpus[0]));
 }
 
-/* verified is 0 when the kernel never completed; only MRAM faults count. */
+/* Unverified DPUs (on a rank with a hung DPU) only get MRAM results. */
 static int
-report_results(const health_state_t *state, int verified,
-               dpu_fault_report_t *report)
+report_results(const health_state_t *state, dpu_fault_report_t *report)
 {
     uint32_t index;
 
@@ -354,8 +406,12 @@ report_results(const health_state_t *state, int verified,
                 != 0)
                 return status;
         }
-        if (!verified || info->crashed)
-            continue; /* No trustworthy output; any crash is reported. */
+        if (!info->verified) {
+            ++report->nr_dpus_unverified;
+            continue;
+        }
+        if (info->crashed)
+            continue; /* No trustworthy output; the crash is reported. */
 
         for (tasklet = 0; tasklet < HEALTH_NR_TASKLETS; ++tasklet)
             if (info->checksums[tasklet]
@@ -388,8 +444,29 @@ setup(struct dpu_set_t set, uint32_t mram_bytes, health_state_t *state)
     uint32_t index;
     size_t chunk_bytes;
 
+    struct dpu_set_t rank_set;
+    uint32_t first = 0;
+
+    state->set = set;
     if (dpu_get_nr_dpus(set, &state->nr_dpus) != DPU_OK
-        || state->nr_dpus == 0)
+        || state->nr_dpus == 0
+        || dpu_get_nr_ranks(set, &state->nr_ranks) != DPU_OK)
+        return -EIO;
+    state->ranks = calloc(state->nr_ranks, sizeof(*state->ranks));
+    if (state->ranks == NULL)
+        return -ENOMEM;
+    index = 0;
+    DPU_RANK_FOREACH(set, rank_set)
+    {
+        rank_state_t *rank = &state->ranks[index++];
+
+        rank->set = rank_set;
+        rank->first = first;
+        if (dpu_get_nr_dpus(rank_set, &rank->nr_dpus) != DPU_OK)
+            return -EIO;
+        first += rank->nr_dpus;
+    }
+    if (first != state->nr_dpus)
         return -EIO;
 
     nr_blocks = (mram_bytes + STRIDE_BYTES - 1) / STRIDE_BYTES
@@ -464,21 +541,33 @@ dpu_faults_health_check(struct dpu_set_t set,
     memset(&state, 0, sizeof(state));
     status = setup(set, mram_bytes, &state);
     if (status == 0)
-        status = for_each_chunk(&state, memory_step, set);
+        status = for_each_chunk(&state, memory_step);
     if (status == 0)
-        status = run_kernel(set, &state, timeout_ms, report);
-    if (status == 0)
-        status = read_checksums(set, &state);
-    if (status == 0)
-        status = for_each_chunk(&state, verify_step, set);
-    if (status == 0)
-        status = report_results(&state, 1, report);
-    else if (status == -ETIMEDOUT) /* Still report pre-launch MRAM faults. */
-        (void)report_results(&state, 0, report);
+        status = run_kernel(&state, timeout_ms, report);
+    if (status == 0 || status == -ETIMEDOUT) {
+        /* After a timeout, finished ranks are still verified. */
+        int kernel_status = status;
+        int report_status;
+        uint32_t index;
+
+        status = read_checksums(&state);
+        if (status == 0)
+            status = for_each_chunk(&state, verify_step);
+        if (status != 0) /* Keep the MRAM results; drop partial output. */
+            for (index = 0; index < state.nr_dpus; ++index)
+                state.dpus[index].verified = 0;
+        report_status = report_results(&state, report);
+        /* -ETIMEDOUT wins: callers must not free a set with hung DPUs. */
+        if (kernel_status != 0)
+            status = kernel_status;
+        else if (status == 0)
+            status = report_status;
+    }
 
     if (report->nr_dpus_checked < state.nr_dpus)
         report->nr_dpus_checked = state.nr_dpus;
     free(state.dpus);
+    free(state.ranks);
     free(state.input);
     free(state.output);
     return status;

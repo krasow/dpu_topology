@@ -51,6 +51,8 @@ typedef struct {
     size_t nr_faults;
     size_t capacity;
     uint32_t nr_dpus_checked;
+    /* DPUs only checked for MRAM faults because a DPU on their rank hung. */
+    uint32_t nr_dpus_unverified;
 } dpu_fault_report_t;
 
 typedef struct {
@@ -86,6 +88,8 @@ int dpu_faults_scan_set(struct dpu_set_t set, dpu_fault_report_t *report);
  * Returns 0 when the check ran (faults, if any, are in the report),
  * -ETIMEDOUT when some DPUs hung (they are reported as DPU_FAULT_TIMEOUT
  * and the set should be abandoned rather than freed), or a negative errno.
+ * A hang only limits its own rank: other ranks are still fully verified,
+ * and the rest of the hung rank is checked for MRAM faults only.
  */
 int dpu_faults_health_check(struct dpu_set_t set,
                             const dpu_health_options_t *options,
