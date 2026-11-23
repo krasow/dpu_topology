@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include "dpu_faults.h"
 #include "dpu_topology.h"
 
 #include <dlfcn.h>

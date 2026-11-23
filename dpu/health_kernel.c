@@ -2,13 +2,13 @@
  * DPU health-check kernel. Every tasklet streams its share of the MRAM heap
  * through WRAM, transforms each 64-bit word, writes it back, and accumulates a
  * checksum. The host recomputes everything and flags DPUs that disagree.
- * Keep the arithmetic in sync with src/dpu_topology_health.c.
+ * Keep the arithmetic in sync with src/health.c.
  */
 #include <defs.h>
 #include <mram.h>
 #include <stdint.h>
 
-#include "../src/dpu_topology_health_common.h"
+#include "health.h"
 
 __host uint64_t health_seed;
 __host uint32_t health_nr_blocks;

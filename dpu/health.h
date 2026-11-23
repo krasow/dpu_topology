@@ -1,5 +1,5 @@
-#ifndef DPU_TOPOLOGY_HEALTH_COMMON_H
-#define DPU_TOPOLOGY_HEALTH_COMMON_H
+#ifndef DPU_TOPOLOGY_HEALTH_H
+#define DPU_TOPOLOGY_HEALTH_H
 
 /* Shared by the host checker and the DPU health kernel. */
 

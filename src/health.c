@@ -1,7 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include "dpu_topology_faults.h"
-#include "dpu_topology_health_common.h"
+#include "internal.h"
+#include "health.h"
 
 #include <dpu_management.h>
 #include <dpu_runner.h>

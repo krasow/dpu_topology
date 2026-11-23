@@ -1,6 +1,6 @@
 #define _XOPEN_SOURCE 700
 
-#include "dpu_topology_internal.h"
+#include "internal.h"
 
 #include <dpu_management.h>
 

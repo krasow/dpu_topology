@@ -1,3 +1,4 @@
+#include "dpu_faults.h"
 #include "dpu_topology.h"
 
 #include <errno.h>

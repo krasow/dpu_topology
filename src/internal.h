@@ -1,7 +1,7 @@
-#ifndef DPU_TOPOLOGY_INTERNAL_H
-#define DPU_TOPOLOGY_INTERNAL_H
+#ifndef DPU_TOPOLOGY_SRC_INTERNAL_H
+#define DPU_TOPOLOGY_SRC_INTERNAL_H
 
-#include "dpu_topology.h"
+#include "dpu_faults.h"
 
 #define DPU_TOPOLOGY_PATH_LEN 512
 #define DPU_TOPOLOGY_VPD_MAX_RANKS 4
@@ -43,5 +43,18 @@ int dpu_topology_rank_sysfs_index(struct dpu_rank_t *rank,
 int dpu_topology_resolve_process_ranks(
     const dpu_rank_topology_t *physical_ranks, size_t nr_physical_ranks,
     const int *numa_nodes, size_t nr_ranks, dpu_rank_topology_t *resolved);
+
+/* Fault report helpers shared by faults.c and health.c. */
+int dpu_fault_report_append(dpu_fault_report_t *report,
+                            const dpu_fault_t *fault);
+
+/* Physical location of an SDK rank, or NUMA-only when unresolvable. */
+void dpu_fault_locate_rank(struct dpu_rank_t *rank,
+                           dpu_rank_topology_t *location);
+
+void dpu_fault_init_for_dpu(dpu_fault_t *fault, struct dpu_t *dpu,
+                            const dpu_rank_topology_t *location,
+                            dpu_fault_kind_t kind, uint32_t set_index,
+                            const char *detail);
 
 #endif

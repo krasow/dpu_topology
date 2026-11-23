@@ -1,4 +1,4 @@
-#include "dpu_topology_faults.h"
+#include "internal.h"
 
 #include <dpu_management.h>
 
