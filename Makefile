@@ -1,20 +1,26 @@
 CC ?= cc
 AR ?= ar
+DPU_CC ?= dpu-upmem-dpurte-clang
 
 BUILD_DIR := build
 INCLUDE_DIR := include
 LIBRARY := $(BUILD_DIR)/libdpu_topology.a
 PRELOAD_LIBRARY := $(BUILD_DIR)/libdpu_topology_preload.so
 TOOL := $(BUILD_DIR)/dpu-topology
+HEALTH_KERNEL := $(BUILD_DIR)/health_kernel.dpu
 SOURCES := src/dpu_topology.c src/dpu_topology_linux.c \
-	src/dpu_topology_print.c src/dpu_topology_query.c
+	src/dpu_topology_print.c src/dpu_topology_query.c \
+	src/dpu_topology_faults.c src/dpu_topology_health.c
 OBJECTS := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(SOURCES))
+HEADERS := include/dpu_topology.h src/dpu_topology_internal.h \
+	src/dpu_topology_faults.h src/dpu_topology_health_common.h
 
 DPU_CFLAGS := $(shell dpu-pkg-config --cflags dpu)
 DPU_LIBS := $(shell dpu-pkg-config --libs dpu)
 CFLAGS ?= -O2
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -fPIC \
 	-I$(INCLUDE_DIR) $(DPU_CFLAGS)
+LDLIBS := $(DPU_LIBS) -ldl -pthread
 
 .PHONY: all clean
 
@@ -23,17 +29,26 @@ all: $(LIBRARY) $(PRELOAD_LIBRARY) $(TOOL)
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(BUILD_DIR)/%.o: src/%.c include/dpu_topology.h src/dpu_topology_internal.h | $(BUILD_DIR)
+$(HEALTH_KERNEL): dpu/health_kernel.c src/dpu_topology_health_common.h | $(BUILD_DIR)
+	UPMEM_NO_OS_WARNING=1 $(DPU_CC) -O2 -Wall -Wextra \
+		-DNR_TASKLETS=16 $< -o $@
+
+$(BUILD_DIR)/%.o: src/%.c $(HEADERS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# The health kernel is embedded with .incbin, so the library is standalone.
+$(BUILD_DIR)/dpu_topology_health.o: $(HEALTH_KERNEL)
+$(BUILD_DIR)/dpu_topology_health.o: CFLAGS += \
+	-DDPU_TOPOLOGY_HEALTH_KERNEL='"$(abspath $(HEALTH_KERNEL))"'
 
 $(LIBRARY): $(OBJECTS)
 	$(AR) rcs $@ $^
 
 $(PRELOAD_LIBRARY): src/dpu_topology_preload.c $(LIBRARY)
-	$(CC) $(CFLAGS) -shared $< $(LIBRARY) $(DPU_LIBS) -ldl -pthread -o $@
+	$(CC) $(CFLAGS) -shared $< $(LIBRARY) $(LDLIBS) -o $@
 
 $(TOOL): tools/dpu-topology.c $(LIBRARY)
-	$(CC) $(CFLAGS) $< $(LIBRARY) $(DPU_LIBS) -o $@
+	$(CC) $(CFLAGS) $< $(LIBRARY) $(LDLIBS) -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)

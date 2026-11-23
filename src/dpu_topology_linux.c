@@ -2,6 +2,8 @@
 
 #include "dpu_topology_internal.h"
 
+#include <dpu_management.h>
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -364,4 +366,170 @@ cleanup:
     free(matches);
     free(open_ranks);
     return status;
+}
+
+int
+dpu_topology_read_physical_rank(uint32_t sysfs_index,
+                                dpu_rank_topology_t *rank)
+{
+    char name[32];
+
+    snprintf(name, sizeof(name), "dpu_rank%u", sysfs_index);
+    return read_rank(name, rank);
+}
+
+static uint64_t
+read_u64_le(const unsigned char *bytes)
+{
+    uint64_t value = 0;
+    int index;
+
+    for (index = 7; index >= 0; --index)
+        value = value << 8 | bytes[index];
+    return value;
+}
+
+/*
+ * Mirrors the SDK's hw backend: a DPU is unusable when its CI is masked by
+ * the driver, when the DIMM VPD marks it disabled, or when the VPD lists an
+ * SRAM repair for it (the SDK currently disables those DPUs too).
+ */
+int
+dpu_topology_read_rank_health(uint32_t sysfs_index,
+                              dpu_rank_health_t *health)
+{
+    /* struct dpu_vpd_header: 16-byte preamble then 4 x 24-byte rank data. */
+    enum {
+        VPD_MAX_BYTES = 2048,
+        VPD_HEADER_BYTES = 16 + DPU_TOPOLOGY_VPD_MAX_RANKS * 24,
+        VPD_REPAIR_BYTES = 16,
+    };
+    unsigned char vpd[VPD_MAX_BYTES];
+    char rank_path[DPU_TOPOLOGY_PATH_LEN];
+    char vpd_path[DPU_TOPOLOGY_PATH_LEN];
+    char name[32];
+    int value;
+    size_t length;
+    FILE *file;
+
+    memset(health, 0, sizeof(*health));
+    health->nr_cis = 8;
+    health->nr_dpus_per_ci = 8;
+    health->ci_mask = 0xff;
+    health->rank_index = -1;
+
+    snprintf(name, sizeof(name), "dpu_rank%u", sysfs_index);
+    if (join_path(rank_path, sizeof(rank_path), DPU_RANK_CLASS, name) != 0)
+        return -ENAMETOOLONG;
+    if (access(rank_path, F_OK) != 0)
+        return -errno;
+
+    if (read_int_attribute(rank_path, "nb_ci", &value) == 0 && value > 0
+        && value <= 8)
+        health->nr_cis = value;
+    if (read_int_attribute(rank_path, "nb_dpus_per_ci", &value) == 0
+        && value > 0 && value <= 8)
+        health->nr_dpus_per_ci = value;
+    if (read_int_attribute(rank_path, "ci_mask", &value) == 0)
+        health->ci_mask = (unsigned)value & 0xff;
+    read_int_attribute(rank_path, "rank_index", &health->rank_index);
+
+    if (join_path(vpd_path, sizeof(vpd_path), rank_path, "dimm_vpd") != 0)
+        return 0;
+    file = fopen(vpd_path, "rb");
+    if (file == NULL)
+        return 0;
+    length = fread(vpd, 1, sizeof(vpd), file);
+    fclose(file);
+
+    if (length < VPD_HEADER_BYTES || memcmp(vpd, "UPMV", 4) != 0)
+        return 0;
+    health->vpd_valid = 1;
+
+    if (health->rank_index >= 0
+        && health->rank_index < DPU_TOPOLOGY_VPD_MAX_RANKS) {
+        uint16_t repair_count = (uint16_t)(vpd[12] | vpd[13] << 8);
+        size_t entry;
+
+        health->vpd_disabled =
+            read_u64_le(vpd + 16 + (size_t)health->rank_index * 24);
+
+        /* 0xffff means "repairs never run"; no entries follow. */
+        for (entry = 0; repair_count != 0xffff && entry < repair_count;
+             ++entry) {
+            const unsigned char *repair =
+                vpd + VPD_HEADER_BYTES + entry * VPD_REPAIR_BYTES;
+            unsigned bit;
+
+            if ((size_t)(repair - vpd) + VPD_REPAIR_BYTES > length)
+                break;
+            if (repair[1] != health->rank_index)
+                continue;
+            bit = (unsigned)repair[2] * (unsigned)health->nr_dpus_per_ci
+                  + repair[3];
+            if (bit < 64)
+                health->vpd_repaired |= UINT64_C(1) << bit;
+        }
+    }
+    return 0;
+}
+
+/*
+ * The hw backend builds SDK rank ids as (backend type << 12) | the driver's
+ * rank_id sysfs attribute, which is also what "26" in a "26.5.3" DPU id is.
+ */
+#define SDK_RANK_TARGET_SHIFT 12
+#define SDK_RANK_TARGET_HW 3
+
+int
+dpu_topology_sdk_rank_number(struct dpu_rank_t *rank)
+{
+    return (int)(dpu_get_rank_id(rank) & ((1u << SDK_RANK_TARGET_SHIFT) - 1));
+}
+
+static int
+rank_id_matches(uint32_t sysfs_index, int driver_rank_id)
+{
+    char rank_path[DPU_TOPOLOGY_PATH_LEN];
+    char name[32];
+    int value;
+
+    snprintf(name, sizeof(name), "dpu_rank%u", sysfs_index);
+    return join_path(rank_path, sizeof(rank_path), DPU_RANK_CLASS, name) == 0
+           && read_int_attribute(rank_path, "rank_id", &value) == 0
+           && value == driver_rank_id;
+}
+
+int
+dpu_topology_rank_sysfs_index(struct dpu_rank_t *rank, uint32_t *sysfs_index)
+{
+    struct dirent *entry;
+    DIR *directory;
+    int driver_rank_id;
+
+    if (rank == NULL || sysfs_index == NULL)
+        return -EINVAL;
+    if ((dpu_get_rank_id(rank) >> SDK_RANK_TARGET_SHIFT) != SDK_RANK_TARGET_HW)
+        return -ENOTSUP;
+    driver_rank_id = dpu_topology_sdk_rank_number(rank);
+
+    /* rank_id normally equals the device number; verify, else search. */
+    if (rank_id_matches((uint32_t)driver_rank_id, driver_rank_id)) {
+        *sysfs_index = (uint32_t)driver_rank_id;
+        return 0;
+    }
+    directory = opendir(DPU_RANK_CLASS);
+    if (directory == NULL)
+        return -errno;
+    while ((entry = readdir(directory)) != NULL) {
+        uint32_t index;
+        if (parse_index(entry->d_name, "dpu_rank", &index) == 0
+            && rank_id_matches(index, driver_rank_id)) {
+            closedir(directory);
+            *sysfs_index = index;
+            return 0;
+        }
+    }
+    closedir(directory);
+    return -ENOENT;
 }

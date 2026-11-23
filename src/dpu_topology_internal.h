@@ -4,8 +4,37 @@
 #include "dpu_topology.h"
 
 #define DPU_TOPOLOGY_PATH_LEN 512
+#define DPU_TOPOLOGY_VPD_MAX_RANKS 4
+
+/* Per-rank DPU availability as recorded by the driver and DIMM VPD. */
+typedef struct {
+    int nr_cis;
+    int nr_dpus_per_ci;
+    unsigned ci_mask;
+    int rank_index;
+    int vpd_valid;
+    /* Bit (ci * nr_dpus_per_ci + member) set when the DPU is affected. */
+    uint64_t vpd_disabled;
+    uint64_t vpd_repaired;
+} dpu_rank_health_t;
 
 void dpu_topology_initialize_rank(dpu_rank_topology_t *rank, int numa_node);
+
+/* Reads /sys/class/dpu_rank/dpu_rank<sysfs_index>. */
+int dpu_topology_read_physical_rank(uint32_t sysfs_index,
+                                    dpu_rank_topology_t *rank);
+int dpu_topology_read_rank_health(uint32_t sysfs_index,
+                                  dpu_rank_health_t *health);
+
+/* Rank number shown in SDK DPU ids such as "26.5.3" (here 26). */
+int dpu_topology_sdk_rank_number(struct dpu_rank_t *rank);
+
+/*
+ * Exact SDK-rank to /dev/dpu_rankN mapping via the driver's rank_id.
+ * Returns -ENOTSUP for non-hardware backends (e.g. the simulator).
+ */
+int dpu_topology_rank_sysfs_index(struct dpu_rank_t *rank,
+                                  uint32_t *sysfs_index);
 
 /*
  * Returns 1 when every rank is resolved, 0 when the process owns additional

@@ -33,6 +33,31 @@ same_channel(const dpu_rank_topology_t *lhs,
            && lhs->numa_node == rhs->numa_node;
 }
 
+/* Maps every SDK rank to its sysfs device through the hw backend. */
+static int
+resolve_exact(struct dpu_rank_t *const *sdk_ranks, size_t nr_ranks,
+              const dpu_rank_topology_t *physical_ranks,
+              size_t nr_physical_ranks, dpu_rank_topology_t *resolved)
+{
+    size_t index;
+
+    for (index = 0; index < nr_ranks; ++index) {
+        uint32_t sysfs_index;
+        size_t candidate;
+
+        if (dpu_topology_rank_sysfs_index(sdk_ranks[index], &sysfs_index)
+            != 0)
+            return 0;
+        for (candidate = 0; candidate < nr_physical_ranks; ++candidate)
+            if (physical_ranks[candidate].sysfs_index == sysfs_index)
+                break;
+        if (candidate == nr_physical_ranks)
+            return 0;
+        resolved[index] = physical_ranks[candidate];
+    }
+    return 1;
+}
+
 static void
 summarize(dpu_set_topology_t *topology)
 {
@@ -98,6 +123,7 @@ dpu_topology_inspect(struct dpu_set_t set, dpu_set_topology_t *topology)
 {
     dpu_rank_topology_t *physical_ranks = NULL;
     int *numa_nodes = NULL;
+    struct dpu_rank_t **sdk_ranks = NULL;
     size_t nr_physical_ranks = 0;
     uint32_t nr_ranks;
     size_t index;
@@ -118,7 +144,9 @@ dpu_topology_inspect(struct dpu_set_t set, dpu_set_topology_t *topology)
 
     topology->ranks = calloc(nr_ranks, sizeof(*topology->ranks));
     numa_nodes = calloc(nr_ranks, sizeof(*numa_nodes));
-    if ((nr_ranks != 0 && topology->ranks == NULL) || numa_nodes == NULL) {
+    sdk_ranks = calloc(nr_ranks, sizeof(*sdk_ranks));
+    if ((nr_ranks != 0 && topology->ranks == NULL) || numa_nodes == NULL
+        || sdk_ranks == NULL) {
         status = -ENOMEM;
         goto cleanup;
     }
@@ -131,21 +159,29 @@ dpu_topology_inspect(struct dpu_set_t set, dpu_set_topology_t *topology)
             status = -EINVAL;
             goto cleanup;
         }
+        sdk_ranks[index] = rank;
         numa_nodes[index] = dpu_get_rank_numa_node(rank);
         dpu_topology_initialize_rank(&topology->ranks[index],
                                      numa_nodes[index]);
     }
 
-    status = dpu_topology_resolve_process_ranks(
-        physical_ranks, nr_physical_ranks, numa_nodes, nr_ranks,
-        topology->ranks);
-    if (status < 0)
-        goto cleanup;
+    if (!resolve_exact(sdk_ranks, nr_ranks, physical_ranks,
+                       nr_physical_ranks, topology->ranks)) {
+        for (index = 0; index < nr_ranks; ++index)
+            dpu_topology_initialize_rank(&topology->ranks[index],
+                                         numa_nodes[index]);
+        status = dpu_topology_resolve_process_ranks(
+            physical_ranks, nr_physical_ranks, numa_nodes, nr_ranks,
+            topology->ranks);
+        if (status < 0)
+            goto cleanup;
+    }
 
     summarize(topology);
     status = 0;
 
 cleanup:
+    free(sdk_ranks);
     free(numa_nodes);
     free(physical_ranks);
     if (status != 0)
